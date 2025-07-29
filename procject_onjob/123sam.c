@@ -2,13 +2,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
 //#include <valgrind/memcheck.h>
+
+void signal_handler(int signo) {
+    printf("Caught signal %d, creating core dump...\n", signo);
+    fflush(stdout);
+    abort();  // This will generate a core dump
+}
 
 int main (const int argc, const char *argv[])
 {
     printf("Hello sam123\n");
     printf("The process ID is %d\n", (int)getpid());
     printf("The parent process ID is %d\n", (int)getppid());  
+
+    //signal(SIGSEGV, signal_handler);
 
     int count = 0;
     while(1)
@@ -28,5 +38,6 @@ int main (const int argc, const char *argv[])
         // for(int i = 0; i < 100000000; i++);
         sleep(1);
     }      
+
     return 0;
 }

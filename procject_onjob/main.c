@@ -16,6 +16,8 @@
 #define PROCESS_NUMBER 5   
 #define handle_err(msg){ perror(msg); exit(EXIT_FAILURE);}
 
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;   //allocted Mutex lock
+
 typedef struct {
     pid_t pid;
     char *process_name;  
@@ -195,6 +197,72 @@ mem_info_t get_heap(pid_t pid)
     return heaps_mem;  
 }
 
+char *get_libc_path(pid_t pid)
+{
+    /*get the path of libc.so.6*/
+    char buff_maps[BUFFER_SIZE] = {0};
+
+    sprintf(buff_maps, "/proc/%d/maps", pid);
+    FILE *maps_file = fopen(buff_maps, "r");
+    if(maps_file == NULL)
+    {
+        handle_err("maps_file fopen()");
+    }
+
+    char line[BUFFER_SIZE];
+    while(fgets(line, BUFFER_SIZE, maps_file) != NULL)
+    {
+        if(strstr(line, "libc.so.6") != NULL)
+        {
+            char *path_start = strchr(line, '/');  // return a pointer to the first of '/'
+            //but path_start is pointing to the "line" buffer, it is a ring buffer, discard when function terminate
+            if(path_start != NULL)
+            {
+                char *libc_path = strdup(path_start);  
+                char *end = strchr(libc_path, '\n'); 
+                if(end != NULL)
+                {
+                    *end = '\0'; 
+                    fclose(maps_file);
+                    return libc_path;
+                }
+            }
+        }
+    }
+    
+    fclose(maps_file);
+    return NULL;
+}
+
+void count_malloc_free(pid_t pid)
+{
+    /*count the number of malloc and free calls using perf*/
+    char buff_perf[BUFFER_SIZE];
+    sprintf(buff_perf, "sudo perf stat -e probe_libc:malloc -e probe_libc:free -p %d sleep 10", pid);
+    FILE *perf = popen(buff_perf, "r");
+    if (perf == NULL) 
+    {
+        handle_err("popen() for perf");
+    }
+
+    char line[BUFFER_SIZE];
+    int malloc_count = 0, free_count = 0;
+    while (fgets(line, BUFFER_SIZE, perf)) 
+    {
+        if (strstr(line, "probe_libc:malloc")) 
+        {
+            sscanf(line - 7, "%d", &malloc_count);
+            printf("Number of malloc: %d\n", malloc_count);
+        }
+        else if (strstr(line, "probe_libc:free")) 
+        {
+            sscanf(line - 7, "%d", &free_count);
+            printf("Number of free: %d\n", free_count);
+        }
+    }
+    pclose(perf);
+}
+
 void dump_mem_to_screen(pid_t pid)
 {
     uint64_t start_address = 0, end_address = 0;
@@ -224,23 +292,39 @@ void *monitor_process(void *args)
 {
     process_info_t *process_info = (process_info_t *)args;
     uint32_t total_mem = get_total_mem();
+
+    //set up perf probe for malloc and free
+    // char *libc_path = get_libc_path(process_info->pid);
+    // printf("Libc path: %s\n", libc_path);
+    // char buff_perf[BUFFER_SIZE];
+    // sprintf(buff_perf, "sudo perf probe -x %s malloc", libc_path);
+    // system(buff_perf);
+    // sprintf(buff_perf, "sudo perf probe -x %s free", libc_path);
+    // system(buff_perf);
+
     for(;;)
     {
+        pthread_mutex_lock(&lock);
         uint32_t rss = get_vsz_rss(process_info->pid);
         mem_info_t stack_mem = get_stack(process_info->pid);
         mem_info_t heap_mem = get_heap(process_info->pid);
-        printf("---------------PID %d----------------\n", process_info->pid);
+        printf("-----------------------------PID %d--------------------------------\n", process_info->pid);
         printf("Name: %s\n",process_info->process_name);
         printf("Total memory of this system (RAM): %d KB\n", total_mem);
-        printf("_____\tVmSIZE\tVmRSS\n");
-        printf("Total\t      \t%d\tKB\n", rss);
-        printf("Stack\t%d\t%d\tKB\n", stack_mem.VmSize, stack_mem.VmRSS);
-        printf("Heap\t%d\t%d\tKB\n", heap_mem.VmSize, heap_mem.VmRSS);
-        printf("----------------------------------------\n");
+        printf("\t_____\tVmSIZE\tVmRSS\n");
+        printf("\tTotal\t      \t%d\tKB\n", rss);
+        printf("\tStack\t%d\t%d\tKB\n", stack_mem.VmSize, stack_mem.VmRSS);
+        printf("\tHeap\t%d\t%d\tKB\n", heap_mem.VmSize, heap_mem.VmRSS);
+        printf("------------------------------------------------------------------------\n");
         dump_mem_to_screen(process_info->pid);
-        printf("\n");
-        sleep(10);
+        printf("________________________________________________________________________\n");
+        printf("________________________________________________________________________\n");
+        pthread_mutex_unlock(&lock);
+        count_malloc_free(process_info->pid);    //sleep(10) is inside this function
+        //sleep(10);
     }
+
+    //free(libc_path);  // strdup la su dung malloc, can phai free
 }
 
 int main(int argc, char *argv[])
@@ -300,6 +384,15 @@ int main(int argc, char *argv[])
         process_info[i].pid = get_pid(&fp, process_info[i].process_name);
         printf("Process name: %s, PID: %d\n", process_info[i].process_name, process_info[i].pid);
 
+        char buff_perf[BUFFER_SIZE];
+        char *libc_path = get_libc_path(process_info[i].pid);
+        sprintf(buff_perf, "sudo perf probe -x %s malloc", libc_path);
+        system(buff_perf);
+        sprintf(buff_perf, "sudo perf probe -x %s free", libc_path);
+        system(buff_perf);
+
+        free(libc_path);  // free the libc_path after using it
+
         if(pthread_create(&thread_id[i], NULL, monitor_process, (void *)&process_info[i]))
         {
             printf("Error thread %i\n", i);
@@ -335,8 +428,7 @@ int main(int argc, char *argv[])
     //     VmSize_KB = 4*strtol(VmSize, NULL, 10);     //may change strol to atoi()
     //     printf("the VM capacity of this proccess (%d): %ld KB\n", pid_process, VmSize_KB);
     // }
-    
-    /*4, Dump bang mem cua process*/
+
 
     pclose(fp);
     return 0;
